@@ -4,7 +4,7 @@ import rospy
 from tf.transformations import quaternion_from_matrix
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import TwistStamped, PoseStamped
-from std_msgs.msg import Int32, Float64
+from std_msgs.msg import Int32
 from sensor_msgs.msg import Imu
 from geometry_msgs.msg import Quaternion
 from mavros_msgs.msg import AttitudeTarget, PositionTarget
@@ -16,11 +16,14 @@ import pathlib, atexit
 from datetime import datetime
 from utils.get_data_new import *
 from utils.matrix_utils import *
+from utils.rotation_to_quaternion import rotation_matrix_to_quaternion
+from utils.others import *
 
 # import components
 from components.stop_trajectory import StopTrajPlanner
 from components.second_order_butterworth import SecondOrderButterworth
 from components.acc_kalman_filter import AccKalmanFilter
+# from components.first_order_low_pass import FirstOrderLowPass
 
 NUM_DRONES = 6  # default number of drones
 CTRL_HZ = 100.0  # default control frequency [Hz]
@@ -48,116 +51,9 @@ polyval_stop = lambda coeff, tau: (
     coeff.polyval(tau) if isinstance(coeff, StopTrajPlanner) else (None, None, None)
 )
 
-def R_to_quat(R: np.ndarray) -> Quaternion:
-    """
-    Convert a 3x3 rotation matrix to a geometry_msgs/Quaternion (x,y,z,w).
-    """
-    assert R.shape == (3, 3)
-    # Build a 4x4 homogeneous matrix for tf
-    M = np.eye(4)
-    M[:3, :3] = R
-    x, y, z, w = quaternion_from_matrix(M)  # returns (x,y,z,w)
-    q = Quaternion()
-    q.x, q.y, q.z, q.w = float(x), float(y), float(z), float(w)
-    return q
-
-def cylinder_inertia(m, r_outer, h, r_inner=0.0):
-    # Check validity
-    if r_inner < 0 or r_inner >= r_outer:
-        raise ValueError("0 ≤ r_inner < r_outer must hold.")
-    
-    # Solid cylinder special-case
-    if r_inner == 0.0:  
-        Izz = 0.5  * m * r_outer**2
-        Ixx = Iyy = (1/12) * m * (3*r_outer**2 + h**2)
-    else:
-        # Hollow cylinder inertia: subtract inner solid from outer solid
-        V_outer = np.pi * r_outer**2 * h
-        V_inner = np.pi * r_inner**2 * h
-        rho       = m / (V_outer - V_inner)       # uniform density
-        
-        m_outer = rho * V_outer
-        m_inner = rho * V_inner
-        
-        Izz = 0.5 * (m_outer * r_outer**2 - m_inner * r_inner**2)
-        Ixx = Iyy = (1/12) * (
-            m_outer * (3*r_outer**2 + h**2) - 
-            m_inner * (3*r_inner**2 + h**2)
-        )
-    return np.diag([Ixx, Iyy, Izz])
-
-def body_angular_velocity(R_prev: np.ndarray,
-                          R_curr: np.ndarray,
-                          dt: float) -> np.ndarray:
-    if dt <= 0.0:                   
-        return np.zeros(3)
-
-    # delta R = R_prev.T * R_curr  (SO(3))
-    delta_R = R_prev.T @ R_curr
-    rot_vec = Rotation.from_matrix(delta_R).as_rotvec()   # rad
-    return rot_vec / dt      
-
-def limit_tilt(body_z: np.ndarray,
-               max_angle_rad: float,
-               eps: float = 1e-6) -> np.ndarray:
-    """
-    Clamp the angle between body_z and world_z (0,0,1) to max_angle_rad.
-    Returns a *unit* vector.
-    """
-    world_z = np.array([0., 0., 1.])
-    body_z = body_z / np.linalg.norm(body_z)              # ensure unit
-    dot = np.clip(np.dot(body_z, world_z), -1.0, 1.0)
-    angle = np.arccos(dot)
-
-    if angle > max_angle_rad:
-        rejection = body_z - dot * world_z               # component ⟂ world_z
-        if np.dot(rejection, rejection) < eps:           # parallel case
-            rejection = np.array([1., 0., 0.])
-        rejection /= np.linalg.norm(rejection)
-        body_z = (np.cos(max_angle_rad) * world_z +
-                  np.sin(max_angle_rad) * rejection)
-
-    return body_z / np.linalg.norm(body_z)
-
-def px4_body_z(acc_sp: np.ndarray,
-               gravity: float = 9.81,
-               decouple: bool = False,
-               max_tilt_deg: float = 45.0) -> np.ndarray:
-    """
-    Re-create PX4 _accelerationControl body_z vector.
-    Unit vector of the body Z-axis expressed in world (NED) frame.
-    """
-    g = gravity
-    z_spec = -g + (0.0 if decouple else acc_sp[2])
-    vec = np.array([-acc_sp[0], -acc_sp[1], -z_spec])
-
-    if np.allclose(vec, 0):
-        vec[2] = 1.0  # safety
-
-    body_z = vec / np.linalg.norm(vec)
-
-    body_z = limit_tilt(body_z, np.deg2rad(max_tilt_deg))
-    return body_z
-
 class GeometricControl:
-    def __init__(self, num_drones: int = NUM_DRONES) -> None:
-        """
-        Subscribes to:
-        /payload_odom
-        /simulation/position_drone_i  (PoseStamped, i=1..N)
-        {ns}/mavros/local_position/pose
-        {ns}/mavros/local_position/velocity
-        {ns}/mavros/imu/data
-        {ns}/state/state_drone_i  (Int32, i=1..N)
-
-        Publishes to:
-        /ros_geom_state/payload_q
-        /ros_geom_state/sim_time
-        """
-        self.num_drones = num_drones
-
-        # simulation time
-        self.sim_time = None
+    def __init__(self, num_drones: int = NUM_DRONES, hz: float = CTRL_HZ) -> None:
+        self.sim_time = None # simulation time
 
         #  payload state 
         self.payload_pos     = None        # position (3,)
@@ -177,131 +73,63 @@ class GeometricControl:
         self.fof = SecondOrderButterworth(cutoff_hz=20.0)
 
         #  drone state (lists) 
-        self.n              = self.num_drones
-        self.drone_pos      = [None] * self.num_drones
-        self.drone_R        = [None] * self.num_drones
-        self.drone_vel      = [None] * self.num_drones
-        self.drone_omega    = [None] * self.num_drones
-        self.drone_lin_acc  = [None] * self.num_drones
-        self.drone_state    = [None] * self.num_drones
+        self.n              = num_drones
+        self.drone_pos      = [None] * self.n
+        self.drone_R        = [None] * self.n
+        self.drone_vel      = [None] * self.n
+        self.drone_omega    = [None] * self.n
+        self.drone_lin_acc  = [None] * self.n
+        self.drone_state    = [None] * self.n
 
         self.ready = False
+
+        # Transformation matrices
         self.T_enu2ned = np.array([[0, 1, 0],
-                     [1, 0, 0],
-                     [0, 0, -1]])
+                                    [1, 0, 0],
+                                    [0, 0, -1]])
         self.T_enu2flu = np.array([[0, -1, 0],
-                     [1, 0, 0],
-                     [0, 0, 1]])
+                                    [1, 0, 0],
+                                    [0, 0, 1]])
         self.T_flu2frd = np.diag([1, -1, -1])
         self.T_trans = self.T_enu2flu @ self.T_flu2frd
         self.T_body = np.array([[0, 1, 0],
-            [1, 0, 0],
-            [0, 0, -1]])
+                                [1, 0, 0],
+                                [0, 0, -1]])
         self.T_xy = np.array([[0, 1, 0],
-            [1, 0, 0],
-            [0, 0, 1]])
+                                [1, 0, 0],
+                                [0, 0, 1]])
 
-        # Publishers
-        self.pub_att = [
-            rospy.Publisher(
-            ("" if i == 0 else f"/px4_{i}") + "/mavros/setpoint_raw/attitude",
-            AttitudeTarget,
-            queue_size=1
-            )
-            for i in range(self.num_drones)
-        ]
-        self.pub_pos = [
-            rospy.Publisher(
-                ("" if i == 0 else f"/px4_{i}") + "/mavros/setpoint_raw/local",
-                PositionTarget,
-                queue_size=1
-            )
-            for i in range(self.num_drones)
-        ]
-        self.pub_cmd = [
-            rospy.Publisher(
-                f"/state/command_drone_{i}",
-                Int32,
-                queue_size=1
-            )
-            for i in range(self.num_drones)
-        ]
+        ## Publishers
+        self.pub_att = [rospy.Publisher(("/mavros/setpoint_raw/attitude" if i == 0 else f"/px4_{i}/mavros/setpoint_raw/attitude"), AttitudeTarget, queue_size=1) for i in range(self.n)]
+        self.pub_pos = [rospy.Publisher((f"/mavros/setpoint_raw/local" if i == 0 else f"/px4_{i}/mavros/setpoint_raw/local"), PositionTarget, queue_size=1) for i in range(self.n)]
+        self.pub_cmd = [rospy.Publisher(f"/state/command_drone_{i}", Int32, queue_size=1) for i in range(self.n)]
 
-        # Delete all pubs below later
-        # Pub
-        self.pub_payload_q = rospy.Publisher('/ros_geom_state/payload_q', Quaternion, queue_size=1)
-        self.pub_sim_time = rospy.Publisher('/ros_geom_state/sim_time', Float64, queue_size=1)
-        self.pub_payload_odom = rospy.Publisher('/ros_geom_state/payload_odom', Odometry, queue_size=1)
-        self.pub_payload_acc = rospy.Publisher('/ros_geom_state/payload_acc', Imu, queue_size=1)
-        # Pub num_drones odoms
-        self.pub_drone_odom = [rospy.Publisher(f'/ros_geom_state/drone_{i}/odom', Odometry, queue_size=1) for i in range(num_drones)]
-        self.pub_drone_acc = [rospy.Publisher(f'/ros_geom_state/drone_{i}/acc', Imu, queue_size=1) for i in range(num_drones)]
-        self.pub_drone_state = [rospy.Publisher(f'/ros_geom_state/drone_{i}/state', Int32, queue_size=1) for i in range(num_drones)]
-
-        # Subscribers
+        ## Subscribers
+        # Payload odometry
         rospy.Subscriber('/payload_odom', Odometry, self._cb_payload_odom, queue_size=1)
         # Drone pose in sim-frame
         for i in range(1, num_drones + 1):
             topic = f"/simulation/position_drone_{i}"
-            rospy.Subscriber(
-                topic,
-                PoseStamped,
-                lambda msg, idx=i-1: self._cb_drone_pose(msg, idx),
-                queue_size=1
-            )
-        # PX4 local-position & odometry per drone
-        for idx in range(self.num_drones):
-            lp_topic = '/mavros/local_position/pose' if idx == 0 \
-                        else '/px4_{}/mavros/local_position/pose'.format(idx)
-            
-            lv_topic = '/mavros/local_position/velocity' if idx == 0 \
-                        else '/px4_{}/mavros/local_position/velocity'.format(idx)
-
-            rospy.Subscriber(
-                lp_topic,
-                PoseStamped,
-                lambda msg, i=idx: self._cb_drone_local_pose(msg, i),
-                queue_size=1
-            )
-            rospy.Subscriber(
-                lv_topic,
-                TwistStamped,
-                lambda msg, i=idx: self._cb_drone_local_velocity(msg, i),
-                queue_size=1
-            )
-
-            #acc_topic = '/mavros/local_position/accel' if idx == 0 \
-            #             else '/px4_{}/mavros/local_position/accel'.format(idx)
-            acc_topic = '/mavros/imu/data' if idx == 0 \
-                         else '/px4_{}/mavros/imu/data'.format(idx)
-            rospy.Subscriber(
-                acc_topic,
-                Imu,
-                lambda msg, i=idx: self._cb_drone_acceleration(msg, i),
-                queue_size=1
-            )
-
+            rospy.Subscriber(topic, PoseStamped, lambda msg, idx=i-1: self._cb_drone_pose(msg, idx), queue_size=1)
+        # PX4 local-position, velocity, acceleration, state, setpoint
+        for idx in range(self.n):
+            lp_topic = '/mavros/local_position/pose' if idx == 0 else '/px4_{}/mavros/local_position/pose'.format(idx)
+            lv_topic = '/mavros/local_position/velocity' if idx == 0 else '/px4_{}/mavros/local_position/velocity'.format(idx)
+            #acc_topic = '/mavros/local_position/accel' if idx == 0 else '/px4_{}/mavros/local_position/accel'.format(idx) # if available
+            acc_topic = '/mavros/imu/data' if idx == 0 else '/px4_{}/mavros/imu/data'.format(idx)
             state_topic = '/state/state_drone_{}'.format(idx)
-            rospy.Subscriber(
-                state_topic,
-                Int32,
-                lambda msg, i=idx: self._cb_drone_state(msg, i),
-                queue_size=1
-            )
+            setpoint_topic = '/mavros/setpoint_raw/target_local' if idx == 0 else '/px4_{}/mavros/setpoint_raw/target_local'.format(idx)
 
-            setpoint_topic = '/mavros/setpoint_raw/target_local' if idx == 0 \
-                                else '/px4_{}/mavros/setpoint_raw/target_local'.format(idx)
-            rospy.Subscriber(
-                setpoint_topic,
-                PositionTarget,
-                lambda msg, i=idx: self._cb_drone_local_position_setpoint(msg, i),
-                queue_size=1
-            )
+            rospy.Subscriber(lp_topic, PoseStamped, lambda msg, i=idx: self._cb_drone_local_pose(msg, i), queue_size=1)
+            rospy.Subscriber(lv_topic, TwistStamped, lambda msg, i=idx: self._cb_drone_local_velocity(msg, i), queue_size=1)
+            rospy.Subscriber(acc_topic, Imu, lambda msg, i=idx: self._cb_drone_acceleration(msg, i), queue_size=1)
+            rospy.Subscriber(state_topic, Int32, lambda msg, i=idx: self._cb_drone_state(msg, i), queue_size=1)
+            rospy.Subscriber(setpoint_topic, PositionTarget, lambda msg, i=idx: self._cb_drone_local_position_setpoint(msg, i), queue_size=1)
+
         self.drone_acc_sp  = [None] * num_drones
 
         # create_timer
         # self.heartbeat = rospy.Timer(rospy.Duration(1.0), self._heartbeat)
-
 
         #--- trajectory ----------------------------------------------
         self.trajectory_ENU = DataLoader()  # get the offline trajectory
@@ -327,13 +155,13 @@ class GeometricControl:
         self.offset_pos = np.array(self.offset_pos)  # shape (num_drones, 3)
 
         I3 = np.eye(3)
-        self.P = np.zeros((6, 3*self.num_drones))           
+        self.P = np.zeros((6, 3*self.n))           
         for i in range(self.n):
             self.P[0:3, 3*i:3*(i+1)] = I3
             self.P[3:6, 3*i:3*(i+1)] = hat(self.rho[i])
 
         # timer
-        self.dt_nom = 1.0 / CTRL_HZ
+        self.dt_nom = 1.0 / hz
         self.dt      = self.dt_nom  
         self.t_prev = None        
         self.t0     = None  
@@ -422,7 +250,7 @@ class GeometricControl:
         atexit.register(self._save_log)
 
 
-        rospy.loginfo('ROSGeomState running with {} drones.'.format(self.num_drones))
+        rospy.loginfo('ROSGeomState running with {} drones.'.format(self.n))
 
     #  Callbacks
     def _cb_drone_local_position_setpoint(self, msg: PositionTarget, idx: int) -> None:
@@ -431,7 +259,7 @@ class GeometricControl:
 
     def _cb_payload_odom(self, msg: Odometry) -> None:
         """Handle /payload_odom, extract pose, velocity, angular velocity."""
-        # now = self.get_clock().now().nanoseconds * 1e-9 # ROS2
+        # now = rospy.Time.now().to_sec()
 
         # Pose -> position & rotation matrix
         p = msg.pose.pose.position
@@ -524,91 +352,6 @@ class GeometricControl:
         rospy.loginfo(
             f'{t:2.4f}s payload position {self.payload_pos} vel {self.payload_vel}'
         )
-
-    # Public accessor
-    # To be deleted after migrating all nodes to ROS2
-    def get_state(self) -> dict | None:
-        """Return deep-copied dict with payload & drone states, or None if not ready."""
-        if not self.ready:
-            return None
-        
-        payload = {
-            'pos':     self.payload_pos.copy(),
-            'R':       self.payload_R.copy(),
-            'vel':     self.payload_vel.copy(),
-            'lin_acc': self.payload_lin_acc.copy(),
-            'omega':   self.payload_ang_v.copy(),
-        }
-
-
-
-        drones = []
-        for i, (p, R, v, o, a) in enumerate(zip(
-            self.drone_pos, self.drone_R,
-            self.drone_vel, self.drone_omega,
-            self.drone_lin_acc,
-        )):
-            drones.append({
-                'pos':     p.copy(),
-                'R':       R.copy(),
-                'vel':     v.copy(),
-                'omega':   o.copy(),
-                'lin_acc': a.copy(),
-                'state':   self.drone_state[i],   
-            })
-        return {'payload': payload, 'drones': drones}
-    
-    # Delete later
-    def pub_snapshot(self) -> None:
-        # Pub this instead of calling get_state [ROS1]
-        if not self.ready:
-            return None
-        
-        # Payload
-        po = Odometry()
-        po.pose.pose.position.x = self.payload_pos[0] # NED
-        po.pose.pose.position.y = self.payload_pos[1]
-        po.pose.pose.position.z = self.payload_pos[2]
-        po.pose.pose.orientation = R_to_quat(self.payload_R)
-        po.twist.twist.linear.x = self.payload_vel[0]  # NED
-        po.twist.twist.linear.y = self.payload_vel[1]
-        po.twist.twist.linear.z = self.payload_vel[2]
-        po.twist.twist.angular.x = self.payload_ang_v[0]  # body frame
-        po.twist.twist.angular.y = self.payload_ang_v[1]
-        po.twist.twist.angular.z = self.payload_ang_v[2]
-        p_acc = Imu()
-        p_acc.linear_acceleration.x = self.payload_lin_acc[0]
-        p_acc.linear_acceleration.y = self.payload_lin_acc[1]
-        p_acc.linear_acceleration.z = self.payload_lin_acc[2]
-        p_acc.angular_velocity = R_to_quat(self.payload_ang_v)
-        self.pub_payload_odom.publish(po)
-        self.pub_payload_acc.publish(p_acc)
-
-        # Drones
-        for i in range(self.num_drones):
-            if self.drone_pos[i] is None or self.drone_R[i] is None:
-                continue
-            do = Odometry()
-            do.pose.pose.position.x = self.drone_pos[i][0]  # NED
-            do.pose.pose.position.y = self.drone_pos[i][1]
-            do.pose.pose.position.z = self.drone_pos[i][2]
-            do.pose.pose.orientation = R_to_quat(self.drone_R[i])
-            do.twist.twist.linear.x = self.drone_vel[i][0]  # NED
-            do.twist.twist.linear.y = self.drone_vel[i][1]
-            do.twist.twist.linear.z = self.drone_vel[i][2]
-            do.twist.twist.angular.x = self.drone_omega[i][0]  # body frame
-            do.twist.twist.angular.y = self.drone_omega[i][1]
-            do.twist.twist.angular.z = self.drone_omega[i][2]
-            self.pub_drone_odom[i].publish(do)
-
-            da = Imu()
-            da.linear_acceleration.x = self.drone_lin_acc[i][0]
-            da.linear_acceleration.y = self.drone_lin_acc[i][1]
-            da.linear_acceleration.z = self.drone_lin_acc[i][2]
-            da.angular_velocity = R_to_quat(self.drone_omega[i])
-            self.pub_drone_acc[i].publish(da)
-
-            self.pub_drone_state[i].publish(Int32(self.drone_state[i]))
 
     def _save_log(self):
         if not self.log['t']:           
@@ -725,13 +468,13 @@ class GeometricControl:
             self.v_id[i] = (self.v_d + self.R_d_dot @ self.rho[i] - self.l * self.q_id_dot[i])  
 
     def _step(self) -> None:
-        #snap = self.state.get_state()
-        if snap is None:
-            return  # not ready yet
-        
-        # unuse
-        #self.fsm_states = [drone["state"] for drone in snap["drones"]]
-        
+        # snap = self.state.get_state()
+        # if snap is None:
+        #     return  # not ready yet
+
+        # unused
+        # self.fsm_states = [drone["state"] for drone in snap["drones"]]
+
         t_now = rospy.Time.now().to_sec()
         self.check_state(self.sim_time)
         if not self.traj_ready:
@@ -740,7 +483,8 @@ class GeometricControl:
             self.t_prev = t_now
             self.t0     = t_now             
             self.dt     = self.dt_nom
-            self.x_start = snap["payload"]["pos"].copy()
+            # self.x_start = snap["payload"]["pos"].copy()
+            self.x_start = self.payload_pos.copy()
         else:
             self.dt     = max(2e-2, t_now - self.t_prev)   
             self.t_prev = t_now
@@ -751,7 +495,7 @@ class GeometricControl:
             # init
             self.sim_t_prev = self.sim_time
             self.sim_dt     = self.dt_nom          # or 0
-            self.x_start    = snap["payload"]["pos"].copy()
+            self.x_start    = self.payload_pos.copy()
         elif self.sim_time - self.sim_t_prev > EPS:
             # update dt
             raw_dt   = self.sim_time - self.sim_t_prev
@@ -760,11 +504,11 @@ class GeometricControl:
         sim_t_rel = self.sim_time - self.sim_t0
 
         #---- payload state ----
-        self.x_0  = snap["payload"]["pos"]      # (3,)
-        self.R_0  = snap["payload"]["R"]        # (3,3)
-        self.v_0  = snap["payload"]["vel"]      # (3,)
-        self.a_0 = snap["payload"]["lin_acc"]  # (3,)
-        self.Omega_0  = snap["payload"]["omega"]      # (3,)
+        self.x_0 = self.payload_pos      # (3,)
+        self.R_0 = self.payload_R        # (3,3)
+        self.v_0 = self.payload_vel      # (3,)
+        self.a_0 = self.payload_lin_acc  # (3,)
+        self.Omega_0 = self.payload_ang_v      # (3,)
         self.Omega_0_hat = hat(self.Omega_0)  # (3,3)
         self.R_0_dot = self.R_0 @ self.Omega_0_hat
         if not hasattr(self, "omega_0_prev"):
@@ -778,7 +522,6 @@ class GeometricControl:
         
 
         #---- drone states ----
-        drones = snap["drones"]
         mu = np.zeros((self.n, 3))
         a = np.zeros((self.n, 3))
         u_parallel = np.zeros((self.n, 3))
@@ -797,12 +540,11 @@ class GeometricControl:
         w_ref     = np.zeros((self.n, 3))
         w_act     = np.zeros((self.n, 3))
 
-        for i, drone in enumerate(drones):
-            # get drone position
-            x_i = drone['pos']                   # (3,)
-            Omega_i = drone['omega']             # (3,)
-            v_i = drone['vel']                   # (3,)
-            R_i = drone['R']                     # (3,3)
+        for i in range(self.n):
+            x_i = self.drone_pos[i]                   # (3,)
+            Omega_i = self.drone_omega[i]             # (3,)
+            v_i = self.drone_vel[i]                   # (3,)
+            R_i = self.drone_R[i]                     # (3,3)
             # compute raw cable vector and normalize to unit q
             vec =   - x_i + self.x_0 + self.R_0 @ self.rho[i]   # vector from attach point to drone
             q_i = vec / np.linalg.norm(vec)          # unit direction along cable
@@ -855,8 +597,10 @@ class GeometricControl:
             ensure_SO3(R_ic)
             t_tmp = rospy.Time.now()
             ts_us = t_tmp.secs * 1_000_000 + t_tmp.nsecs // 1000
-            att = VehicleAttitudeSetpoint()
-            att.timestamp = ts_us
+            # att = VehicleAttitudeSetpoint()
+            att = AttitudeTarget()
+            # att.timestamp = ts_us
+            att.header.stamp = ts_us # ROS1 timestamp is in seconds
             q_new = rotation_matrix_to_quaternion(R_ic)
             q_new = np.asarray(q_new, dtype=np.float32).reshape(4,)  
             if self.drone_q_prev[i] is None:
@@ -865,18 +609,21 @@ class GeometricControl:
             if np.dot(q_new, self.drone_q_prev[i]) < 0.0:
                 q_new = -q_new
 
-            att.q_d = q_new.tolist()                                  # ROS msg, list
+            # NED -> ENU
+            q_new = ned_quat_to_enu(q_new[3], q_new[0], q_new[1], q_new[2])  # w, x, y, z
             self.drone_q_prev[i] = q_new
             norm = - f_i / self.max_thrust - self.thrust_bias
             norm = np.clip(norm , -1.0, -0.1)
-            att.thrust_body = [0.0, 0.0, norm]
+            # att.thrust_body = [0.0, 0.0, norm]
+            att.thrust = -norm
             if not self.traj_done: #and  sim_t_rel < 6.0:
                 self.pub_att[i].publish(att)
 
-            traj = TrajectorySetpoint()
-            traj.timestamp = ts_us
-            traj.position = self.x_id[i].astype(np.float32)
-            traj.velocity = self.v_id[i].astype(np.float32)
+            traj = PositionTarget()
+            traj.header.stamp = ts_us
+            # NED -> ENU
+            traj.position.x, traj.position.y, traj.position.z = float(self.x_id[i][1]), float(self.x_id[i][0]), -float(self.x_id[i][2])
+            traj.velocity.x, traj.velocity.y, traj.velocity.z = float(self.v_id[i][1]), float(self.v_id[i][0]), -float(self.v_id[i][2])
             # traj.velocity = [np.nan, np.nan, np.nan]  # velocity is not used in PX4
             # traj.acceleration = [np.nan, np.nan, np.nan]
             # traj.yaw = 0.0
@@ -906,13 +653,50 @@ class GeometricControl:
         self.log["w_act"].append(w_act.copy()) 
         # breakpoint()
 
+    def check_state(self, t):
+        ready       = np.isin(self.fsm_states, [3, 4]).all()
+        part_ready  = np.isin(self.fsm_states, [3, 4, 5]).all()
+        traj_ready_ = np.isin(self.fsm_states, [5]).all()
+
+        msg = Int32()
+        msg.data = TRAJ   # =5
+
+        if not self.traj_ready and np.any((self.fsm_states == ARMING) | (self.fsm_states == TAKEOFF)):
+            return
+
+        if ready:
+            if self.sim_t0 is None:
+                self.sim_t0 = t 
+            self.t_wait_traj = t - self.sim_t0
+            for i in range(self.n):
+                self.pub_cmd[i].publish(msg)   
+
+        if part_ready:
+            idxs = [i for i, v in enumerate(self.fsm_states) if v != TRAJ]
+            for i in idxs:
+                self.pub_cmd[i].publish(msg)
+
+        if (not self.traj_ready) and (self.t_wait_traj > 5.0 or traj_ready_):
+            self.get_logger().info(f"All drones ready, start TRAJ at t={t:.2f}s")
+            self.traj_ready = True
+            self.traj_t0 = t                   
+
+        if self.traj_ready and (not self.traj_done) and (t - self.traj_t0 >= self.traj_duration):
+            msg.data = 6
+            fsm_states = np.atleast_1d(self.fsm_states)  # Ensures it's at least a 1D array
+            idxs = np.where(fsm_states != 6)[0]
+            # print(idxs)
+            for i in idxs:
+                self.pub_cmd[i].publish(msg)
+                self.traj_done_bit[i] = True
+            if np.all(self.traj_done_bit):
+                self.traj_done = True
 
 def main() -> None:
-    rospy.init_node('ros_geom_state')
-    node = GeometricControl(num_drones=NUM_DRONES)
-    rospy.Timer(rospy.Duration(0.02), lambda event: node.pub_snapshot())
-    rospy.loginfo("Initialise ros_geom_state node!")
-    rospy.spin()  # Keep the node running until shutdown
+    rospy.init_node('geom_multilift_centralised')
+    GeometricControl(num_drones=NUM_DRONES, hz=CTRL_HZ)
+    rospy.loginfo("Initialise geom_multilift_centralised node!")
+    rospy.spin()
 
 if __name__ == '__main__':
     main()
